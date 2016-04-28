@@ -16,14 +16,18 @@ import (
 )
 
 func TestPipelineClientDoSerial(t *testing.T) {
-	testPipelineClientDoConcurrent(t, 1)
+	testPipelineClientDoConcurrent(t, 1, 0)
 }
 
 func TestPipelineClientDoConcurrent(t *testing.T) {
-	testPipelineClientDoConcurrent(t, 10)
+	testPipelineClientDoConcurrent(t, 10, 0)
 }
 
-func testPipelineClientDoConcurrent(t *testing.T, concurrency int) {
+func TestPipelineClientDoBatchDelayConcurrent(t *testing.T) {
+	testPipelineClientDoConcurrent(t, 10, 5*time.Millisecond)
+}
+
+func testPipelineClientDoConcurrent(t *testing.T, concurrency int, maxBatchDelay time.Duration) {
 	ln := fasthttputil.NewInmemoryListener()
 
 	s := &Server{
@@ -44,8 +48,10 @@ func testPipelineClientDoConcurrent(t *testing.T, concurrency int) {
 		Dial: func(addr string) (net.Conn, error) {
 			return ln.Dial()
 		},
-		MaxIdleConnDuration: 5 * time.Millisecond,
-		MaxPendingRequests:  2,
+		MaxIdleConnDuration: 23 * time.Millisecond,
+		MaxPendingRequests:  6,
+		MaxBatchDelay:       maxBatchDelay,
+		Logger:              &customLogger{},
 	}
 
 	clientStopCh := make(chan struct{}, concurrency)
@@ -59,7 +65,7 @@ func testPipelineClientDoConcurrent(t *testing.T, concurrency int) {
 	for i := 0; i < concurrency; i++ {
 		select {
 		case <-clientStopCh:
-		case <-time.After(time.Second):
+		case <-time.After(3 * time.Second):
 			t.Fatalf("timeout")
 		}
 	}
@@ -596,7 +602,7 @@ func TestClientHTTPSConcurrent(t *testing.T) {
 	defer sHTTPS.Stop()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		addr := "http://" + addrHTTP
 		if i&1 != 0 {
@@ -604,7 +610,7 @@ func TestClientHTTPSConcurrent(t *testing.T) {
 		}
 		go func() {
 			defer wg.Done()
-			testClientGet(t, &defaultClient, addr, 30)
+			testClientGet(t, &defaultClient, addr, 20)
 			testClientPost(t, &defaultClient, addr, 10)
 		}()
 	}
@@ -621,13 +627,13 @@ func TestClientManyServers(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		addr := "http://" + addrs[i]
 		go func() {
 			defer wg.Done()
-			testClientGet(t, &defaultClient, addr, 300)
-			testClientPost(t, &defaultClient, addr, 100)
+			testClientGet(t, &defaultClient, addr, 20)
+			testClientPost(t, &defaultClient, addr, 10)
 		}()
 	}
 	wg.Wait()

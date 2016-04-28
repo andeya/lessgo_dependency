@@ -367,10 +367,9 @@ type RequestCtx struct {
 
 	userValues userData
 
-	id uint64
-
 	lastReadDuration time.Duration
 
+	connID         uint64
 	connRequestNum uint64
 	connTime       time.Time
 
@@ -535,7 +534,15 @@ var zeroTCPAddr = &net.TCPAddr{
 
 // ID returns unique ID of the request.
 func (ctx *RequestCtx) ID() uint64 {
-	return ctx.id
+	return (ctx.connID << 32) | ctx.connRequestNum
+}
+
+// ConnID returns unique connection ID.
+//
+// This ID may be used to match distinct requests to the same incoming
+// connection.
+func (ctx *RequestCtx) ConnID() uint64 {
+	return ctx.connID
 }
 
 // Time returns RequestHandler call time.
@@ -1152,7 +1159,8 @@ func newTLSListenerEmbed(ln net.Listener, certData, keyData []byte) (net.Listene
 
 func newCertListener(ln net.Listener, cert *tls.Certificate) net.Listener {
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{*cert},
+		Certificates:             []tls.Certificate{*cert},
+		PreferServerCipherSuites: true,
 	}
 	return tls.NewListener(ln, tlsConfig)
 }
@@ -1335,42 +1343,43 @@ func (s *Server) getConcurrency() int {
 	return n
 }
 
+var globalConnID uint64
+
+func nextConnID() uint64 {
+	return atomic.AddUint64(&globalConnID, 1)
+}
+
 func (s *Server) serveConn(c net.Conn) error {
+	connRequestNum := uint64(0)
+	connID := nextConnID()
 	currentTime := time.Now()
 	connTime := currentTime
-	connRequestNum := uint64(0)
 
 	ctx := s.acquireCtx(c)
+	ctx.connTime = connTime
 	var (
 		br *bufio.Reader
 		bw *bufio.Writer
-	)
-	var (
+
 		err             error
-		connectionClose bool
-		isHTTP11        bool
 		timeoutResponse *Response
 		hijackHandler   HijackHandler
+
+		lastReadDeadlineTime  time.Time
+		lastWriteDeadlineTime time.Time
+
+		connectionClose bool
+		isHTTP11        bool
 	)
 	for {
-		ctx.id++
 		connRequestNum++
 		ctx.time = currentTime
 
 		if s.ReadTimeout > 0 || s.MaxKeepaliveDuration > 0 {
-			readTimeout := s.ReadTimeout
-			if s.MaxKeepaliveDuration > 0 {
-				connTimeout := s.MaxKeepaliveDuration - currentTime.Sub(connTime)
-				if connTimeout <= 0 {
-					err = ErrKeepaliveTimeout
-					break
-				}
-				if connTimeout < readTimeout {
-					readTimeout = connTimeout
-				}
-			}
-			if err = c.SetReadDeadline(currentTime.Add(readTimeout)); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetReadDeadline(%s): %s", readTimeout, err))
+			lastReadDeadlineTime = s.updateReadDeadline(c, ctx, lastReadDeadlineTime)
+			if lastReadDeadlineTime.IsZero() {
+				err = ErrKeepaliveTimeout
+				break
 			}
 		}
 
@@ -1436,10 +1445,21 @@ func (s *Server) serveConn(c net.Conn) error {
 		connectionClose = s.DisableKeepalive || ctx.Request.Header.connectionCloseFast()
 		isHTTP11 = ctx.Request.Header.IsHTTP11()
 
+		ctx.connID = connID
 		ctx.connRequestNum = connRequestNum
 		ctx.connTime = connTime
 		ctx.time = currentTime
 		s.Handler(ctx)
+
+		timeoutResponse = ctx.timeoutResponse
+		if timeoutResponse != nil {
+			ctx = s.acquireCtx(c)
+			timeoutResponse.CopyTo(&ctx.Response)
+			if br != nil {
+				// Close connection, since br may be attached to the old ctx via ctx.fbr.
+				ctx.SetConnectionClose()
+			}
+		}
 
 		if !ctx.IsGet() && ctx.IsHead() {
 			ctx.Response.SkipBody = true
@@ -1451,36 +1471,12 @@ func (s *Server) serveConn(c net.Conn) error {
 
 		ctx.userValues.Reset()
 
-		timeoutResponse = ctx.timeoutResponse
-		if timeoutResponse != nil {
-			ctx = s.acquireCtx(c)
-			timeoutResponse.CopyTo(&ctx.Response)
-			if br != nil {
-				// Close connection, since br may be attached to the old ctx via ctx.fbr.
-				ctx.SetConnectionClose()
-			}
-		}
 		if s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn) {
 			ctx.SetConnectionClose()
 		}
 
 		if s.WriteTimeout > 0 || s.MaxKeepaliveDuration > 0 {
-			writeTimeout := s.WriteTimeout
-			if s.MaxKeepaliveDuration > 0 {
-				connTimeout := s.MaxKeepaliveDuration - time.Since(connTime)
-				if connTimeout <= 0 {
-					// MaxKeepAliveDuration exceeded, but let's try sending response anyway
-					// in 100ms with 'Connection: close' header.
-					ctx.SetConnectionClose()
-					connTimeout = 100 * time.Millisecond
-				}
-				if connTimeout < writeTimeout {
-					writeTimeout = connTimeout
-				}
-			}
-			if err = c.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
-				panic(fmt.Sprintf("BUG: error in SetWriteDeadline(%s): %s", writeTimeout, err))
-			}
+			lastWriteDeadlineTime = s.updateWriteDeadline(c, ctx, lastWriteDeadlineTime)
 		}
 
 		// Verify Request.Header.connectionCloseFast() again,
@@ -1551,6 +1547,59 @@ func (s *Server) serveConn(c net.Conn) error {
 	}
 	s.releaseCtx(ctx)
 	return err
+}
+
+func (s *Server) updateReadDeadline(c net.Conn, ctx *RequestCtx, lastDeadlineTime time.Time) time.Time {
+	readTimeout := s.ReadTimeout
+	currentTime := ctx.time
+	if s.MaxKeepaliveDuration > 0 {
+		connTimeout := s.MaxKeepaliveDuration - currentTime.Sub(ctx.connTime)
+		if connTimeout <= 0 {
+			return zeroTime
+		}
+		if connTimeout < readTimeout {
+			readTimeout = connTimeout
+		}
+	}
+
+	// Optimization: update read deadline only if more than 25%
+	// of the last read deadline exceeded.
+	// See https://github.com/golang/go/issues/15133 for details.
+	if currentTime.Sub(lastDeadlineTime) > (readTimeout >> 2) {
+		if err := c.SetReadDeadline(currentTime.Add(readTimeout)); err != nil {
+			panic(fmt.Sprintf("BUG: error in SetReadDeadline(%s): %s", readTimeout, err))
+		}
+		lastDeadlineTime = currentTime
+	}
+	return lastDeadlineTime
+}
+
+func (s *Server) updateWriteDeadline(c net.Conn, ctx *RequestCtx, lastDeadlineTime time.Time) time.Time {
+	writeTimeout := s.WriteTimeout
+	if s.MaxKeepaliveDuration > 0 {
+		connTimeout := s.MaxKeepaliveDuration - time.Since(ctx.connTime)
+		if connTimeout <= 0 {
+			// MaxKeepAliveDuration exceeded, but let's try sending response anyway
+			// in 100ms with 'Connection: close' header.
+			ctx.SetConnectionClose()
+			connTimeout = 100 * time.Millisecond
+		}
+		if connTimeout < writeTimeout {
+			writeTimeout = connTimeout
+		}
+	}
+
+	// Optimization: update write deadline only if more than 25%
+	// of the last write deadline exceeded.
+	// See https://github.com/golang/go/issues/15133 for details.
+	currentTime := time.Now()
+	if currentTime.Sub(lastDeadlineTime) > (writeTimeout >> 2) {
+		if err := c.SetWriteDeadline(currentTime.Add(writeTimeout)); err != nil {
+			panic(fmt.Sprintf("BUG: error in SetWriteDeadline(%s): %s", writeTimeout, err))
+		}
+		lastDeadlineTime = currentTime
+	}
+	return lastDeadlineTime
 }
 
 func hijackConnHandler(r io.Reader, c net.Conn, s *Server, h HijackHandler) {
@@ -1716,14 +1765,10 @@ func (s *Server) acquireCtx(c net.Conn) *RequestCtx {
 	v := s.ctxPool.Get()
 	var ctx *RequestCtx
 	if v == nil {
-		ctx = &RequestCtx{
+		v = &RequestCtx{
 			s: s,
-			c: c,
 		}
-		ctx.initID()
-		return ctx
 	}
-
 	ctx = v.(*RequestCtx)
 	ctx.c = c
 	return ctx
@@ -1744,9 +1789,9 @@ func (ctx *RequestCtx) Init(req *Request, remoteAddr net.Addr, logger Logger) {
 	if logger == nil {
 		logger = defaultLogger
 	}
+	ctx.connID = nextConnID()
 	ctx.logger.logger = logger
 	ctx.s = &fakeServer
-	ctx.initID()
 	req.CopyTo(&ctx.Request)
 	ctx.Response.Reset()
 	ctx.connRequestNum = 0
@@ -1779,12 +1824,6 @@ func (fa *fakeAddrer) Write(p []byte) (int, error) {
 
 func (fa *fakeAddrer) Close() error {
 	panic("BUG: unexpected Close call")
-}
-
-var globalCtxID uint64
-
-func (ctx *RequestCtx) initID() {
-	ctx.id = (atomic.AddUint64(&globalCtxID, 1)) << 32
 }
 
 func (s *Server) releaseCtx(ctx *RequestCtx) {

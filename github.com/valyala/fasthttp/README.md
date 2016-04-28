@@ -6,8 +6,9 @@
 # fasthttp
 Fast HTTP implementation for Go.
 
-Currently fasthttp is successfully used in a production serving 100K rps from 1M
-concurrent keep-alive connections on a single server.
+Currently fasthttp is successfully used by [VertaMedia](https://vertamedia.com/)
+in a production serving 100K rps from more than 1M concurrent keep-alive
+connections per physical server.
 
 [TechEmpower Benchmark round 12 results](https://www.techempower.com/benchmarks/#section=data-r12&hw=peak&test=plaintext)
 
@@ -260,8 +261,10 @@ like in net/http. The following code is valid for fasthttp:
   ```
 
 * Fasthttp doesn't provide [ServeMux](https://golang.org/pkg/net/http/#ServeMux),
-but there are more powerful third-party routers with fasthttp support exist:
+but there are more powerful third-party routers and web frameworks
+with fasthttp support exist:
 
+  * [Iris](https://github.com/kataras/iris)
   * [fasthttp-routing](https://github.com/qiangxue/fasthttp-routing)
   * [fasthttprouter](https://github.com/buaazp/fasthttprouter)
   * [echo v2](https://github.com/labstack/echo)
@@ -368,7 +371,8 @@ before returning from [RequestHandler](https://godoc.org/github.com/valyala/fast
 While fasthttp is optimized for speed, its' performance may be easily saturated
 by slow [RequestHandler](https://godoc.org/github.com/valyala/fasthttp#RequestHandler).
 So [profile](http://blog.golang.org/profiling-go-programs) and optimize your
-code after switching to fasthttp.
+code after switching to fasthttp. For instance, use [quicktemplate](https://github.com/valyala/quicktemplate)
+instead of [html/template](https://golang.org/pkg/html/template/).
 
 * See also [fasthttputil](https://godoc.org/github.com/valyala/fasthttp/fasthttputil),
 [fasthttpadaptor](https://godoc.org/github.com/valyala/fasthttp/fasthttpadaptor) and
@@ -398,8 +402,12 @@ code after switching to fasthttp.
 * Avoid conversion between `[]byte` and `string`, since this may result in memory
   allocation+copy. Fasthttp API provides functions for both `[]byte` and `string` -
   use these functions instead of converting manually between `[]byte` and `string`.
+  There are some exceptions - see [this wiki page](https://github.com/golang/go/wiki/CompilerOptimizations#string-and-byte)
+  for more details.
 * Verify your tests and production code under
   [race detector](https://golang.org/doc/articles/race_detector.html) on a regular basis.
+* Prefer [quicktemplate](https://github.com/valyala/quicktemplate) instead of
+  [html/template](https://golang.org/pkg/html/template/) in your webserver.
 
 
 # Tricks with `[]byte` buffers
@@ -518,8 +526,9 @@ uintBuf := fasthttp.AppendUint(nil, 1234)
 * *Are there plans to add request routing to fasthttp?*
 
   There are no plans to add request routing into fasthttp.
-  Use third-party routers with fasthttp support:
+  Use third-party routers and web frameworks with fasthttp support:
 
+    * [Iris](https://github.com/kataras/iris)
     * [fasthttp-routing](https://github.com/qiangxue/fasthttp-routing)
     * [fasthttprouter](https://github.com/buaazp/fasthttprouter)
     * [echo v2](https://github.com/labstack/echo)
